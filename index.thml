@@ -1,0 +1,126 @@
+/**
+ * ระบบติดตามความก้าวหน้าการจัดเก็บข้อมูล จปฐ. และ กชช. 2ค พ.ศ. 2570
+ * จังหวัดอุทัยธานี · 8 อำเภอ
+ * หน้าดูข้อมูลเป็นสาธารณะตามสิทธิ์ Deploy; การบันทึกต้องผ่านรหัสผ่านฝั่งเซิร์ฟเวอร์
+ */
+const SHEET_NAME = 'Progress2570';
+const DISTRICTS = ['เมืองอุทัยธานี','ทัพทัน','สว่างอารมณ์','หนองฉาง','หนองขาหย่าง','บ้านไร่','ลานสัก','ห้วยคต'];
+const TYPES = ['จปฐ.','กชช. 2ค'];
+// SHA-256 ของรหัสผ่านที่ผู้ดูแลกำหนด: ไม่มีรหัสผ่านข้อความปกติฝังในไฟล์เว็บ
+const EDITOR_PASSWORD_HASH = '4b6edeadea3c9fe9904f3d7d6c539a902ef40fdb940b271da47b38079b0794b1';
+
+
+
+function digestHex_(candidate) {
+  const raw = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, candidate, Utilities.Charset.UTF_8);
+  return raw.map(b => ('0' + (b & 255).toString(16)).slice(-2)).join('');
+}
+function isEditorPasswordValid_(candidate) {
+  if (typeof candidate !== 'string' || candidate.length < 8 || candidate.length > 256) return false;
+  const provided = digestHex_(candidate);
+  let diff = 0;
+  for (let i = 0; i < EDITOR_PASSWORD_HASH.length; i++) {
+    diff |= provided.charCodeAt(i) ^ EDITOR_PASSWORD_HASH.charCodeAt(i);
+  }
+  return diff === 0;
+}
+/** ใช้กับหน้ากรอกรหัสผ่านเท่านั้น: ไม่มีการส่งรหัสผ่านตัวจริงกลับ */
+function verifyEditorPassword(candidate) {
+  return isEditorPasswordValid_(candidate);
+}
+
+function getSheet_() {
+  const props = PropertiesService.getScriptProperties();
+  let id = props.getProperty('SPREADSHEET_ID');
+  if (!id) {
+    const lock = LockService.getScriptLock();
+    lock.waitLock(20000);
+    try {
+      id = props.getProperty('SPREADSHEET_ID');
+      if (!id) {
+        const created = SpreadsheetApp.create('ความก้าวหน้าการจัดเก็บข้อมูล จปฐ. และ กชช. 2ค จังหวัดอุทัยธานี 2570');
+        id = created.getId();
+        props.setProperty('SPREADSHEET_ID', id);
+      }
+    } finally { lock.releaseLock(); }
+  }
+  const ss = SpreadsheetApp.openById(id);
+  let ws = ss.getSheetByName(SHEET_NAME);
+  if (!ws) {
+    ws = ss.insertSheet(SHEET_NAME);
+    ws.appendRow(['ประเภทข้อมูล','อำเภอ','เป้าหมาย','จัดเก็บแล้ว','อัปเดตล่าสุด','ผู้บันทึก']);
+    ws.setFrozenRows(1);
+    ws.getRange(1,1,1,6).setFontWeight('bold').setBackground('#d9f1ec');
+    ws.autoResizeColumns(1,6);
+  }
+  return ws;
+}
+function formatThaiDateTime_(value) {
+  const date = new Date(value), tz = 'Asia/Bangkok';
+  const yBE = Number(Utilities.formatDate(date, tz, 'yyyy')) + 543;
+  return Utilities.formatDate(date, tz, 'dd/MM/') + String(yBE) + Utilities.formatDate(date, tz, ' HH:mm');
+}
+function getDashboardData() {
+  const ws = getSheet_();
+  const source = ws.getLastRow() > 1 ? ws.getRange(2,1,ws.getLastRow()-1,6).getValues() : [];
+  const rows = [];
+  TYPES.forEach(type => DISTRICTS.forEach(district => {
+    const found = source.slice().reverse().find(r => r[0] === type && r[1] === district);
+    rows.push({
+      type, district,
+      target: found ? Math.max(0,Number(found[2])||0) : 0,
+      collected: found ? Math.max(0,Number(found[3])||0) : 0,
+      configured: !!found,
+      updated: found && found[4] ? formatThaiDateTime_(found[4]) : '',
+      editor: found ? String(found[5]||'') : ''
+    });
+  }));
+  return {rows,updatedAt:formatThaiDateTime_(new Date())};
+}
+function saveProgress(payload) {
+  // สำคัญ: ตรวจรหัสผ่านที่เซิร์ฟเวอร์ทุกครั้งก่อนเขียนชีต แม้เรียกฟังก์ชันตรงจาก DevTools
+  if (!payload || !isEditorPasswordValid_(payload.password)) throw new Error('รหัสผ่านไม่ถูกต้อง ไม่อนุญาตให้บันทึกข้อมูล');
+  if (!TYPES.includes(payload.type) || !DISTRICTS.includes(payload.district)) throw new Error('ประเภทข้อมูลหรืออำเภอไม่ถูกต้อง');
+  const target = Number(payload.target), collected = Number(payload.collected);
+  if (!Number.isSafeInteger(target) || !Number.isSafeInteger(collected) || target<0 || collected<0 || collected>target)
+    throw new Error('กรุณาระบุจำนวนเต็มที่ไม่ติดลบ และยอดจัดเก็บต้องไม่เกินเป้าหมาย');
+  let editor = String(payload.editor||'').trim().slice(0,100);
+  if (/^[=+\-@]/.test(editor)) editor = '\'' + editor; // ป้องกัน spreadsheet formula injection
+  const ws = getSheet_();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const existing = ws.getLastRow()>1 ? ws.getRange(2,1,ws.getLastRow()-1,2).getValues() : [];
+    const idx = existing.findIndex(r=>r[0]===payload.type && r[1]===payload.district);
+    const record=[payload.type,payload.district,target,collected,new Date(),editor];
+    if(idx>=0) ws.getRange(idx+2,1,1,6).setValues([record]);
+    else ws.appendRow(record);
+  } finally { lock.releaseLock(); }
+  return getDashboardData();
+}
+/* ต้องการใช้ Google Sheet ที่มีอยู่ ให้ตั้ง Script Properties ชื่อ SPREADSHEET_ID
+ * ในเมนู Project Settings → Script properties; ไม่เปิดการแก้ไข ID ให้ผู้ชมเว็บเรียกได้
+ */
+
+/** GitHub Pages can read via JSONP without a CORS proxy. Only public aggregate information is returned. */
+function doGet(e) {
+  if (e && e.parameter && e.parameter.action === 'data') {
+    const callback = String(e.parameter.callback || '');
+    if (!/^[a-zA-Z_$][a-zA-Z0-9_$]{0,100}$/.test(callback)) return ContentService.createTextOutput('Invalid callback');
+    const json = JSON.stringify(getDashboardData());
+    return ContentService.createTextOutput(callback + '(' + json + ');').setMimeType(ContentService.MimeType.JAVASCRIPT);
+  }
+  return HtmlService.createHtmlOutputFromFile('Index').setTitle('Dashboard อุทัยธานี 2570').addMetaTag('viewport','width=device-width, initial-scale=1');
+}
+/** GitHub Pages submits form fields via HTTPS POST into an invisible iframe.
+    Password is NEVER added to URL/query strings, and is checked by saveProgress(). */
+function doPost(e) {
+  let result = {kind:'uthai-save-v1',nonce:String(e && e.parameter && e.parameter.nonce || ''),ok:false};
+  try {
+    const p = e.parameter;
+    const data = saveProgress({type:p.type,district:p.district,target:p.target,collected:p.collected,editor:p.editor,password:p.password});
+    result.ok = true;result.data = data;
+  } catch(error) { result.error = String(error.message || error); }
+  const msg = JSON.stringify(result).replace(/</g,'\\u003c');
+  return HtmlService.createHtmlOutput('<!doctype html><meta charset="utf-8"><script>window.parent.postMessage('+msg+',"*");<\/script>');
+}
